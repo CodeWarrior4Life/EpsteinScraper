@@ -1,0 +1,23 @@
+# Auth & session
+session_cookies.json
+
+# Progress & cache
+download_progress.json
+urls_cache.csv
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / AI
+.vscode/
+.idea/
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
