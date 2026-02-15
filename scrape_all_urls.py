@@ -111,6 +111,15 @@ def authenticate(driver):
     except Exception:
         pass
 
+    # If running non-interactively, can't prompt for manual auth
+    if not sys.stdin.isatty():
+        log.error(
+            "Authentication failed (cookies expired?) and running non-interactively. "
+            "Run interactively first to refresh cookies:\n"
+            "  python scrape_all_urls.py --query EFTA"
+        )
+        sys.exit(1)
+
     # Need manual auth
     print("\n" + "=" * 60)
     print("BROWSER SESSION — PASS THE SITE CHALLENGES")
@@ -182,27 +191,43 @@ def scrape_with_api(driver, query="*"):
             """)
         except Exception as e:
             log.error(f"Browser fetch failed on page {page}: {e}")
-            return None
+            if all_urls:
+                log.info(f"Returning {len(all_urls)} partial URLs collected before error")
+            return all_urls or None
 
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             log.warning(f"Non-JSON response on page {page}")
-            return None
+            if all_urls:
+                log.info(f"Returning {len(all_urls)} partial URLs collected before error")
+            return all_urls or None
 
-        if "error" in data:
+        # Handle different response formats
+        if isinstance(data, list):
+            # API returned a bare array — treat each item as a hit
+            hits = data
+            total = len(data)
+        elif isinstance(data, dict) and "error" in data:
             log.warning(f"API error on page {page}: {data['error']}")
-            return None
-
-        # Elasticsearch response: {"hits": {"total": {"value": N}, "hits": [{"_source": {...}}]}}
-        outer_hits = data.get("hits", data)
-        if isinstance(outer_hits, dict):
-            total_obj = outer_hits.get("total", {})
-            total = total_obj.get("value", 0) if isinstance(total_obj, dict) else total_obj
-            hits = outer_hits.get("hits", [])
+            if all_urls:
+                log.info(f"Returning {len(all_urls)} partial URLs collected before error")
+            return all_urls or None
+        elif isinstance(data, dict):
+            # Elasticsearch response: {"hits": {"total": {"value": N}, "hits": [{"_source": {...}}]}}
+            outer_hits = data.get("hits", data)
+            if isinstance(outer_hits, dict):
+                total_obj = outer_hits.get("total", {})
+                total = total_obj.get("value", 0) if isinstance(total_obj, dict) else total_obj
+                hits = outer_hits.get("hits", [])
+            else:
+                total = data.get("total", 0)
+                hits = outer_hits if isinstance(outer_hits, list) else []
         else:
-            total = data.get("total", 0)
-            hits = outer_hits if isinstance(outer_hits, list) else []
+            log.warning(f"Unexpected response type on page {page}: {type(data).__name__}")
+            if all_urls:
+                log.info(f"Returning {len(all_urls)} partial URLs collected before error")
+            return all_urls or None
 
         if total_pages is None:
             total_pages = (int(total) + 9) // 10
@@ -381,80 +406,103 @@ def main():
     )
     args = parser.parse_args()
 
-    # Launch browser and authenticate
-    driver = setup_driver(headless=args.headless)
+    # If query is "*", try multiple broad queries to cover the full library
+    if args.query == "*":
+        queries = [
+            "EFTA",          # Most files have EFTA prefix — proven to return results
+            "DataSet",       # Category prefix
+            "no images produced",
+            "deposition",
+            "transcript",
+            "exhibit",
+            "document",
+            "photograph",
+            "video",
+            "image",
+            "record",
+            "report",
+            "letter",
+            "email",
+            "statement",
+            "testimony",
+            "interview",
+            "subpoena",
+            "motion",
+            "filing",
+        ]
+        log.info(f"Wildcard mode: running {len(queries)} broad queries...")
+        raw_urls = set()
 
-    try:
-        authenticate(driver)
+        # Launch browser
+        driver = setup_driver(headless=args.headless)
+        try:
+            authenticate(driver)
+        except SystemExit:
+            driver.quit()
+            raise
 
-        # If query is "*", try multiple broad queries to cover the full library
-        if args.query == "*":
-            queries = [
-                "EFTA",          # Most files have EFTA prefix — proven to return results
-                "DataSet",       # Category prefix
-                "no images produced",
-                "deposition",
-                "transcript",
-                "exhibit",
-                "document",
-                "photograph",
-                "video",
-                "image",
-                "record",
-                "report",
-                "letter",
-                "email",
-                "statement",
-                "testimony",
-                "interview",
-                "subpoena",
-                "motion",
-                "filing",
-            ]
-            log.info(f"Wildcard mode: running {len(queries)} broad queries...")
-            raw_urls = set()
-            rate_limited = False
-            for i, q in enumerate(queries):
-                if rate_limited:
-                    log.info(f"Rate limited — waiting 60s before query {q!r}...")
-                    time.sleep(60)
-                    # Reload the page to reset any block
-                    driver.get(EPSTEIN_URL)
-                    time.sleep(3)
-                    rate_limited = False
+        for i, q in enumerate(queries):
+            log.info(f"--- Query {i+1}/{len(queries)}: {q!r} ---")
 
-                log.info(f"--- Query {i+1}/{len(queries)}: {q!r} ---")
+            # Check if browser is still alive; restart if needed
+            try:
+                driver.current_url
+            except Exception:
+                log.warning("Browser session died — restarting Chrome...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                time.sleep(5)
+                driver = setup_driver(headless=args.headless)
+                try:
+                    authenticate(driver)
+                except SystemExit:
+                    log.error("Could not re-authenticate after browser restart")
+                    break
+
+            result = scrape_with_api(driver, query=q)
+            if result is None:
+                # API returned 0 results — try restarting browser and retrying
+                log.warning(f"  API failed for {q!r} — restarting browser and retrying...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                time.sleep(10)
+                driver = setup_driver(headless=args.headless)
+                try:
+                    authenticate(driver)
+                except SystemExit:
+                    log.error("Could not re-authenticate after browser restart")
+                    break
                 result = scrape_with_api(driver, query=q)
                 if result is None:
-                    # API failed (likely 403 rate limit)
-                    rate_limited = True
-                    log.warning(f"  API failed for {q!r} — will retry after cooldown")
-                    # Wait and retry this one query
-                    log.info("  Waiting 60s for rate limit cooldown...")
-                    time.sleep(60)
-                    driver.get(EPSTEIN_URL)
-                    time.sleep(3)
-                    result = scrape_with_api(driver, query=q)
-                    if result is None:
-                        log.warning(f"  Retry also failed for {q!r} — skipping")
-                        continue
-                    rate_limited = False
+                    log.warning(f"  Retry also failed for {q!r} — skipping")
 
-                if result:
-                    before = len(raw_urls)
-                    raw_urls |= result
-                    log.info(f"  +{len(raw_urls) - before} new (total: {len(raw_urls)})")
+            if result:
+                before = len(raw_urls)
+                raw_urls |= result
+                log.info(f"  +{len(raw_urls) - before} new (total: {len(raw_urls)})")
 
-                # Polite delay between queries to avoid rate limiting
-                if i < len(queries) - 1:
-                    time.sleep(5)
-        else:
-            # Single query
+            # Polite delay between queries to avoid rate limiting
+            if i < len(queries) - 1:
+                time.sleep(5)
+
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    else:
+        # Single query
+        driver = setup_driver(headless=args.headless)
+        try:
+            authenticate(driver)
             raw_urls = scrape_with_api(driver, query=args.query)
             if raw_urls is None:
                 raw_urls = scrape_with_selenium(driver, query=args.query)
-    finally:
-        driver.quit()
+        finally:
+            driver.quit()
 
     if not raw_urls:
         log.warning("No new URLs collected from scraping.")
