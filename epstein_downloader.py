@@ -129,7 +129,12 @@ DEFAULT_REQUIRED_COOKIES = [
 ]
 DEFAULT_PDF_COLUMN = "PDF URL"
 DEFAULT_VIDEO_COLUMN = "MOV URL"
-DEFAULT_VIDEO_EXTENSIONS = ["mov", "mp4", "wmv", "avi", "3gp", "3g2", "m4v", "mpg", "flv", "webm"]
+DEFAULT_VIDEO_EXTENSIONS = [
+    # Video formats
+    "mov", "mp4", "wmv", "avi", "3gp", "3g2", "m4v", "mpg", "flv", "webm",
+    # Image formats
+    "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic", "svg",
+]
 
 MAX_DOWNLOAD_WORKERS = 5
 MAX_RETRIES = 3
@@ -574,7 +579,7 @@ def download_pair(session, pdf_url, video_url, base_dir,
     pdf_path = os.path.join(folder, f"{file_id}.pdf")
     pdf_ok = download_file(session, pdf_url, pdf_path)
 
-    # Try video extensions in order (.mov, then .mp4, etc.)
+    # Try companion file extensions in order (.mov, .mp4, .jpg, etc.)
     vid_ok = False
     actual_vid_path = None
     base_video_url = video_url.rsplit(".", 1)[0] if "." in video_url else video_url
@@ -593,9 +598,9 @@ def download_pair(session, pdf_url, video_url, base_dir,
             actual_vid_path = vid_path
             break
 
-    # If no video was retrieved, skip this record entirely
+    # If no companion file was retrieved, skip this record entirely
     if not vid_ok:
-        log.info(f"No video found for {file_id} — removing folder")
+        log.info(f"No companion file found for {file_id} — removing folder")
         shutil.rmtree(folder, ignore_errors=True)
         return False, False, group, file_id
 
@@ -907,8 +912,9 @@ def main():
     dl.add_argument(
         "--video-extensions", type=str, default=None,
         help=(
-            "Comma-separated video extensions to try in order "
-            "(default: mov,mp4,wmv,avi,3gp,3g2,m4v,mpg,flv,webm)"
+            "Comma-separated companion file extensions to try in order "
+            "(default: mov,mp4,wmv,avi,3gp,3g2,m4v,mpg,flv,webm,"
+            "jpg,jpeg,png,gif,bmp,tiff,tif,webp,heic,svg)"
         ),
     )
 
