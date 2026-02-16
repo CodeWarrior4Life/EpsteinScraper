@@ -549,10 +549,11 @@ def dehydrate_files(base_dir):
 
 def download_pair(session, pdf_url, video_url, base_dir,
                   video_extensions=None, immediate_dehydrate=False):
-    """Download a PDF/video pair into a named folder.
+    """Download a PDF and optional companion media into a named folder.
 
     Tries each video extension in order (e.g. .mov then .mp4).
-    If no video is retrieved, the folder is removed entirely.
+    The PDF is always kept if it downloads successfully — companion
+    media is a bonus, not a requirement.
     """
     if video_extensions is None:
         video_extensions = DEFAULT_VIDEO_EXTENSIONS
@@ -598,11 +599,14 @@ def download_pair(session, pdf_url, video_url, base_dir,
             actual_vid_path = vid_path
             break
 
-    # If no companion file was retrieved, skip this record entirely
-    if not vid_ok:
-        log.info(f"No companion file found for {file_id} — removing folder")
+    # If nothing downloaded at all, clean up the empty folder
+    if not pdf_ok and not vid_ok:
+        log.info(f"Nothing downloaded for {file_id} — removing empty folder")
         shutil.rmtree(folder, ignore_errors=True)
         return False, False, group, file_id
+
+    if not vid_ok:
+        log.debug(f"No companion media for {file_id} — keeping PDF")
 
     # Immediately dehydrate to free local space
     if immediate_dehydrate:
