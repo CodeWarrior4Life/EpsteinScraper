@@ -744,6 +744,11 @@ def download_pair(downloader, pdf_url, video_url, base_dir,
     pdf_path = os.path.join(folder, f"{file_id}.pdf")
     pdf_ok = downloader(pdf_url, pdf_path)
 
+    # If PDF definitely not available (404, not transient), skip video
+    if not pdf_ok and not os.path.exists(pdf_path):
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, False, group, file_id
+
     # Try companion file extensions in order (.mov, .mp4, .jpg, etc.)
     vid_ok = False
     actual_vid_path = None
@@ -987,6 +992,34 @@ def folder_exists_for_pair(pdf_url, output_dir):
     return False
 
 
+def scan_existing_folders(output_dir):
+    """Scan output directory once and return set of existing pair keys.
+
+    Much faster than calling folder_exists_for_pair per URL, especially
+    on virtual filesystems like Google Drive mounts.
+    """
+    existing = set()
+    if not os.path.isdir(output_dir):
+        return existing
+
+    log.info("Scanning existing folders in %s ...", output_dir)
+    for group_name in os.listdir(output_dir):
+        group_dir = os.path.join(output_dir, group_name)
+        if not os.path.isdir(group_dir):
+            continue
+        try:
+            for folder_name in os.listdir(group_dir):
+                # Extract file_id: either bare "EFTA123" or "EFTA123 - summary"
+                file_id = folder_name.split(" - ")[0]
+                pair_key = f"{group_name}/{file_id}"
+                existing.add(pair_key)
+        except PermissionError:
+            log.debug("Permission denied listing %s (may be dehydrated)", group_dir)
+
+    log.info("Found %d existing folders on disk", len(existing))
+    return existing
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1217,15 +1250,15 @@ def main():
         save_progress(completed)
     else:
         # Skip pairs that are in the progress file OR have a folder on disk.
-        # The folder check acts as an automatic delta — if the folder exists
-        # from a previous run (even if progress.json was reset), we skip it.
+        # Scan existing folders once (fast) rather than per-URL listdir (slow
+        # on virtual filesystems like Google Drive).
+        existing_on_disk = scan_existing_folders(output_dir)
         remaining = []
         for p, m in pairs:
             pair_key = f"{parse_url_info(p)[0]}/{parse_url_info(p)[1]}"
             if pair_key in completed:
                 continue
-            if folder_exists_for_pair(p, output_dir):
-                # Folder exists on disk but wasn't in progress file — sync it
+            if pair_key in existing_on_disk:
                 completed.add(pair_key)
                 continue
             remaining.append((p, m))
