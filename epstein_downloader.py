@@ -1102,7 +1102,7 @@ def main():
     # ── Download options ───────────────────────────────────
     dl = parser.add_argument_group("Download options")
     dl.add_argument(
-        "--output", type=str, default=DEFAULT_OUTPUT_DIR,
+        "--output", type=str, default=None,
         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})",
     )
     dl.add_argument(
@@ -1184,10 +1184,24 @@ def main():
             if e.strip()
         ]
 
+    # ── Resolve output directory ─────────────────────────────
     output_dir = args.output
+    if output_dir is None:
+        # Interactive prompt if not in a non-interactive/special mode
+        if not args.no_prompt and not args.dehydrate_only and not args.resummarize:
+            print("\n" + "=" * 60)
+            print("OUTPUT DIRECTORY")
+            print("=" * 60)
+            print(f"\nDefault: {DEFAULT_OUTPUT_DIR}")
+            user_dir = input(
+                "Enter output directory (or press ENTER for default): "
+            ).strip()
+            output_dir = user_dir if user_dir else DEFAULT_OUTPUT_DIR
+        else:
+            output_dir = DEFAULT_OUTPUT_DIR
 
     print("=" * 60)
-    print("BULK FILE DOWNLOADER v3")
+    print("BULK FILE DOWNLOADER v4")
     print(f"Output: {output_dir}")
     print("=" * 60)
 
