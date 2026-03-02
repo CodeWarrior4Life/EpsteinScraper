@@ -53,38 +53,55 @@ def load_cookies():
 
 
 def setup_driver(headless=False):
-    """Create a Selenium Chrome driver."""
+    """Launch Chrome with CDP and return a Selenium WebDriver.
+
+    Connects to an existing CDP Chrome if available, otherwise launches one.
+    """
+    from browser_utils import launch_chrome, connect_to_chrome
+
+    # Check if Chrome with CDP is already running
     try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-    except ImportError:
-        log.error("Selenium not installed. Run: pip install selenium")
-        sys.exit(1)
+        import urllib.request
+        urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2)
+        log.info("Found existing Chrome with CDP on port 9222")
+    except Exception:
+        launch_chrome()
 
-    options = Options()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    if headless:
-        options.add_argument("--headless=new")
-
-    try:
-        driver = webdriver.Chrome(options=options)
-    except Exception as e:
-        log.error(f"Could not start Chrome: {e}")
-        sys.exit(1)
-
-    return driver
+    return connect_to_chrome()
 
 
 def authenticate(driver):
     """
-    Navigate to the Epstein Library, inject cached cookies if available,
-    or let the user pass challenges manually.
-    """
-    driver.get(EPSTEIN_URL)
-    time.sleep(2)
+    Ensure the browser is on justice.gov and the API is reachable.
 
-    # Try injecting cached cookies
+    Queue-IT blocks page navigation but NOT same-origin fetch() calls,
+    so we just need to be on any justice.gov page.  No need to pass
+    the Queue-IT challenge or age verification for API scraping.
+    """
+    # Make sure we're on justice.gov (any page works for same-origin fetch)
+    if "justice.gov" not in driver.current_url:
+        driver.get(EPSTEIN_URL)
+        time.sleep(3)
+
+    # Verify the API is reachable via fetch()
+    try:
+        raw = driver.execute_async_script("""
+            const cb = arguments[arguments.length - 1];
+            fetch("/multimedia-search?keys=EFTA&page=0", {credentials: "same-origin"})
+              .then(r => r.json())
+              .then(d => cb(JSON.stringify({ok: true, total: d.hits?.total?.value || 0})))
+              .catch(e => cb(JSON.stringify({ok: false, err: e.message})));
+        """)
+        result = json.loads(raw)
+        if result.get("ok"):
+            log.info("API reachable via browser fetch (total EFTA: %s) -- ready to scrape", result.get("total"))
+            return True
+        else:
+            log.warning("API fetch returned error: %s", result.get("err"))
+    except Exception as e:
+        log.warning("API fetch test failed: %s", e)
+
+    # Fallback: try injecting cached cookies and retrying
     cached = load_cookies()
     if cached:
         log.info("Injecting cached cookies...")
@@ -99,50 +116,9 @@ def authenticate(driver):
             except Exception:
                 pass
         driver.refresh()
-        time.sleep(2)
+        time.sleep(3)
 
-    # Check if we need manual intervention (age gate, Queue-IT, etc.)
-    # The search input should be visible if auth is good
-    from selenium.webdriver.common.by import By
-    try:
-        driver.find_element(By.CSS_SELECTOR, "#searchInput")
-        log.info("Search interface accessible — authentication OK")
-        return True
-    except Exception:
-        pass
-
-    # If running non-interactively, can't prompt for manual auth
-    if not sys.stdin.isatty():
-        log.error(
-            "Authentication failed (cookies expired?) and running non-interactively. "
-            "Run interactively first to refresh cookies:\n"
-            "  python scrape_all_urls.py --query EFTA"
-        )
-        sys.exit(1)
-
-    # Need manual auth
-    print("\n" + "=" * 60)
-    print("BROWSER SESSION — PASS THE SITE CHALLENGES")
-    print("=" * 60)
-    print(f"""
-The DOJ Epstein Library requires:
-  1. Queue-IT bot challenge (wait in queue)
-  2. Age verification (click "Yes")
-
-Complete these in the Chrome window, then come back
-here and press ENTER once you see the search box.
-""")
-    input(">>> Press ENTER after passing all challenges... ")
-
-    # Save the new cookies
-    browser_cookies = driver.get_cookies()
-    cookie_dict = {}
-    for c in browser_cookies:
-        cookie_dict[c["name"]] = c["value"]
-    with open(COOKIE_CACHE_FILE, "w") as f:
-        json.dump(cookie_dict, f, indent=2)
-    log.info(f"Saved {len(cookie_dict)} cookies to {COOKIE_CACHE_FILE}")
-
+    log.info("Authentication setup complete")
     return True
 
 
@@ -310,11 +286,27 @@ def scrape_with_selenium(driver, query="*"):
 
     all_urls = set()
 
-    # Enter search query
-    search_input = driver.find_element(By.CSS_SELECTOR, "#searchInput")
+    # Enter search query — try multiple selectors
+    search_input = None
+    for sel in ["input[type=search]", "#search-field-en-small-desktop",
+                "#searchInput", "input[name=query]"]:
+        try:
+            search_input = driver.find_element(By.CSS_SELECTOR, sel)
+            if search_input.is_displayed():
+                break
+        except Exception:
+            search_input = None
+    if search_input is None:
+        log.error("Could not find search input on page")
+        return set()
     search_input.clear()
     search_input.send_keys(query)
-    driver.find_element(By.CSS_SELECTOR, "#searchButton").click()
+    # Try to submit via button or Enter key
+    try:
+        driver.find_element(By.CSS_SELECTOR, "#searchButton").click()
+    except Exception:
+        from selenium.webdriver.common.keys import Keys
+        search_input.send_keys(Keys.RETURN)
 
     time.sleep(3)  # Wait for initial results
 

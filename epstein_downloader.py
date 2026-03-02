@@ -113,6 +113,7 @@ import shutil
 import requests
 from urllib.parse import unquote, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 
 
 # ============================================================
@@ -448,6 +449,23 @@ def parse_url_info(url):
         file_id = os.path.splitext(filename)[0]
         return dataset, file_id
 
+    # DOJ Epstein generic: /epstein/files/CATEGORY/.../FILE
+    ep_match = re.search(r"/epstein/files/(.+)/([^/]+)$", decoded)
+    if ep_match:
+        category = ep_match.group(1)
+        filename = ep_match.group(2)
+        file_id = os.path.splitext(filename)[0]
+        # Sanitize each path segment for Windows filenames
+        parts = category.split("/")
+        safe_parts = []
+        for part in parts:
+            safe = re.sub(r'[\\:*?"<>|]', "_", part).strip()
+            safe = safe[:80]
+            if safe:
+                safe_parts.append(safe)
+        safe_cat = os.path.join(*safe_parts) if safe_parts else "Other"
+        return safe_cat, file_id
+
     # Generic: use domain as group, filename stem as ID
     parsed = urlparse(url)
     domain = parsed.netloc.replace("www.", "").replace(".", "_")
@@ -503,6 +521,148 @@ def download_file(session, url, local_path):
 
 
 # ============================================================
+# BROWSER-BASED FILE DOWNLOAD
+# ============================================================
+
+_FETCH_JS = """\
+const callback = arguments[arguments.length - 1];
+const url = arguments[0];
+(async () => {
+    try {
+        const resp = await fetch(url, {credentials: 'same-origin'});
+        if (!resp.ok) {
+            callback(JSON.stringify({status: resp.status}));
+            return;
+        }
+        const blob = await resp.blob();
+        if (blob.size === 0) {
+            callback(JSON.stringify({ok: true, base64: '', size: 0}));
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+            const dataUrl = reader.result || '';
+            const idx = dataUrl.indexOf(',');
+            const b64 = idx >= 0 ? dataUrl.substring(idx + 1) : '';
+            callback(JSON.stringify({ok: true, base64: b64, size: blob.size}));
+        };
+        reader.onerror = () => {
+            callback(JSON.stringify({error: 'FileReader failed'}));
+        };
+        reader.readAsDataURL(blob);
+    } catch(e) {
+        callback(JSON.stringify({error: e.message}));
+    }
+})();
+"""
+
+
+def download_file_browser(driver, url, local_path):
+    """Download a single file using browser fetch(). Returns True on success."""
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return True
+
+    encoded_url = url.replace(" ", "%20")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw = driver.execute_async_script(_FETCH_JS, encoded_url)
+            result = json.loads(raw)
+
+            if result.get("status") in (403, 404):
+                log.warning(f"{result['status']}: {url}")
+                return False
+
+            if not result.get("ok"):
+                error = result.get("error", result.get("status", "unknown"))
+                raise RuntimeError(error)
+
+            data = result.get("base64", "")
+            if not data:
+                log.warning(f"Empty response: {url}")
+                return False
+
+            file_bytes = base64.b64decode(data)
+            temp_path = local_path + ".tmp"
+            with open(temp_path, "wb") as f:
+                f.write(file_bytes)
+
+            if os.path.getsize(temp_path) > 0:
+                os.replace(temp_path, local_path)
+                return True
+            else:
+                os.remove(temp_path)
+                log.warning(f"Empty file: {url}")
+                return False
+
+        except Exception as e:
+            log.warning(f"Attempt {attempt}/{MAX_RETRIES} for {url}: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+            for p in [local_path + ".tmp"]:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+    log.error(f"FAILED after {MAX_RETRIES} retries: {url}")
+    return False
+
+
+def setup_browser(port=9222):
+    """Connect to (or launch) Chrome with CDP for browser-based downloads."""
+    from browser_utils import connect_to_chrome, launch_chrome
+    import urllib.request
+
+    # Try connecting to existing Chrome
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/version", timeout=2
+        )
+        log.info("Found existing Chrome on port %d", port)
+    except Exception:
+        log.info("Launching Chrome with remote debugging...")
+        launch_chrome(port=port)
+
+    driver = connect_to_chrome(port=port)
+
+    # Navigate to justice.gov to establish same-origin context
+    log.info("Navigating to DOJ site to establish browser context...")
+    try:
+        driver.get("https://www.justice.gov/epstein")
+    except Exception:
+        pass  # May hit Queue-IT page, that's fine
+    time.sleep(2)
+
+    # Verify fetch works
+    js = (
+        "const callback = arguments[arguments.length - 1];"
+        "(async () => {"
+        "  try {"
+        "    const resp = await fetch("
+        "      '/multimedia-search?keys=EFTA&page=0',"
+        "      {credentials: 'same-origin'}"
+        "    );"
+        "    callback(JSON.stringify({status: resp.status, ok: resp.ok}));"
+        "  } catch(e) {"
+        "    callback(JSON.stringify({error: e.message}));"
+        "  }"
+        "})();"
+    )
+    raw = driver.execute_async_script(js)
+    result = json.loads(raw)
+    if result.get("ok"):
+        log.info("Browser connection verified — fetch API working!")
+    else:
+        log.warning("Browser fetch test returned: %s", result)
+
+    driver.set_script_timeout(300)  # 5 min for large file downloads
+    return driver
+
+
+# ============================================================
 # DEHYDRATION (Google Drive online-only)
 # ============================================================
 
@@ -547,13 +707,17 @@ def dehydrate_files(base_dir):
 # DOWNLOAD PAIR (PDF + VIDEO)
 # ============================================================
 
-def download_pair(session, pdf_url, video_url, base_dir,
+def download_pair(downloader, pdf_url, video_url, base_dir,
                   video_extensions=None, immediate_dehydrate=False):
     """Download a PDF and optional companion media into a named folder.
 
-    Tries each video extension in order (e.g. .mov then .mp4).
-    The PDF is always kept if it downloads successfully — companion
-    media is a bonus, not a requirement.
+    Args:
+        downloader: callable(url, local_path) -> bool
+        pdf_url: URL of the PDF file
+        video_url: URL of the companion media file
+        base_dir: base output directory
+        video_extensions: list of extensions to try for companion media
+        immediate_dehydrate: mark files as online-only after download
     """
     if video_extensions is None:
         video_extensions = DEFAULT_VIDEO_EXTENSIONS
@@ -578,7 +742,7 @@ def download_pair(session, pdf_url, video_url, base_dir,
 
     # Download PDF
     pdf_path = os.path.join(folder, f"{file_id}.pdf")
-    pdf_ok = download_file(session, pdf_url, pdf_path)
+    pdf_ok = downloader(pdf_url, pdf_path)
 
     # Try companion file extensions in order (.mov, .mp4, .jpg, etc.)
     vid_ok = False
@@ -589,11 +753,11 @@ def download_pair(session, pdf_url, video_url, base_dir,
         # First attempt: use the original URL for the first extension
         if ext == video_extensions[0]:
             vid_path = os.path.join(folder, f"{file_id}.{ext}")
-            vid_ok = download_file(session, video_url, vid_path)
+            vid_ok = downloader(video_url, vid_path)
         else:
             alt_url = base_video_url + "." + ext
             vid_path = os.path.join(folder, f"{file_id}.{ext}")
-            vid_ok = download_file(session, alt_url, vid_path)
+            vid_ok = downloader(alt_url, vid_path)
 
         if vid_ok:
             actual_vid_path = vid_path
@@ -894,6 +1058,13 @@ def main():
             "(default: DOJ Epstein cookies)"
         ),
     )
+    auth.add_argument(
+        "--no-browser", action="store_true",
+        help=(
+            "Use requests library instead of browser for downloads. "
+            "Browser mode (default) is required for sites with bot detection."
+        ),
+    )
 
     # ── Download options ───────────────────────────────────
     dl = parser.add_argument_group("Download options")
@@ -1019,13 +1190,21 @@ def main():
 
     # ── Phase 2: Authenticate ──────────────────────────────
 
-    session = get_session(
-        manual=args.manual,
-        auto_use_cache=args.no_prompt,
-        auth_url=args.auth_url,
-        required_cookies=required_cookies,
-        cookie_domain=args.cookie_domain,
-    )
+    use_browser = not args.no_browser
+
+    if use_browser:
+        log.info("Using browser-based downloads (Chrome CDP)")
+        driver = setup_browser()
+        downloader = lambda url, path: download_file_browser(driver, url, path)
+    else:
+        session = get_session(
+            manual=args.manual,
+            auto_use_cache=args.no_prompt,
+            auth_url=args.auth_url,
+            required_cookies=required_cookies,
+            cookie_domain=args.cookie_domain,
+        )
+        downloader = lambda url, path: download_file(session, url, path)
 
     # ── Phase 3: Download all pairs (parallel) ─────────────
 
@@ -1064,38 +1243,67 @@ def main():
         succeeded = failed = 0
         save_every = 25
 
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {}
-            for pdf_url, vid_url in remaining:
-                future = executor.submit(
-                    download_pair, session, pdf_url, vid_url, output_dir,
-                    video_extensions=video_extensions,
-                    immediate_dehydrate=args.dehydrate,
-                )
-                futures[future] = (pdf_url, vid_url)
-
-            for i, future in enumerate(as_completed(futures), 1):
-                pdf_url, vid_url = futures[future]
+        if use_browser:
+            # Sequential downloads (browser fetch is not thread-safe)
+            for i, (pdf_url, vid_url) in enumerate(remaining, 1):
                 try:
-                    pdf_ok, vid_ok, group, file_id = future.result()
+                    pdf_ok, vid_ok, group, file_id = download_pair(
+                        downloader, pdf_url, vid_url, output_dir,
+                        video_extensions=video_extensions,
+                        immediate_dehydrate=args.dehydrate,
+                    )
                     pair_key = f"{group}/{file_id}"
                     if pdf_ok or vid_ok:
-                        with progress_lock:
-                            completed.add(pair_key)
+                        completed.add(pair_key)
                         succeeded += 1
                     else:
                         failed += 1
                 except Exception as e:
-                    log.error(f"Exception: {e}")
+                    log.error(f"Exception downloading {pdf_url}: {e}")
                     failed += 1
 
-                if i % 10 == 0 or i == len(futures):
+                if i % 10 == 0 or i == len(remaining):
                     log.info(
-                        f"Downloads: {i}/{len(futures)} | "
+                        f"Downloads: {i}/{len(remaining)} | "
                         f"OK={succeeded} Failed={failed}"
                     )
                 if i % save_every == 0:
                     save_progress(completed)
+        else:
+            # Parallel downloads with requests
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {}
+                for pdf_url, vid_url in remaining:
+                    future = executor.submit(
+                        download_pair, downloader, pdf_url, vid_url,
+                        output_dir,
+                        video_extensions=video_extensions,
+                        immediate_dehydrate=args.dehydrate,
+                    )
+                    futures[future] = (pdf_url, vid_url)
+
+                for i, future in enumerate(as_completed(futures), 1):
+                    pdf_url, vid_url = futures[future]
+                    try:
+                        pdf_ok, vid_ok, group, file_id = future.result()
+                        pair_key = f"{group}/{file_id}"
+                        if pdf_ok or vid_ok:
+                            with progress_lock:
+                                completed.add(pair_key)
+                            succeeded += 1
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        log.error(f"Exception: {e}")
+                        failed += 1
+
+                    if i % 10 == 0 or i == len(futures):
+                        log.info(
+                            f"Downloads: {i}/{len(futures)} | "
+                            f"OK={succeeded} Failed={failed}"
+                        )
+                    if i % save_every == 0:
+                        save_progress(completed)
 
         save_progress(completed)
         log.info(f"Download phase complete.  OK={succeeded}  Failed={failed}")

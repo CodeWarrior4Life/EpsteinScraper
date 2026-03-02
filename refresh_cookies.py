@@ -1,185 +1,130 @@
 # -*- coding: utf-8 -*-
-"""Refresh DOJ Epstein Library cookies via Selenium Chrome."""
+"""Refresh / verify Chrome CDP connection for DOJ Epstein Library downloads.
+
+Launches Chrome with remote debugging (or connects to an existing instance),
+navigates to the DOJ site, and verifies the browser fetch() API works.
+Once this succeeds, epstein_downloader.py can use the same Chrome instance.
+"""
 import json
 import sys
 import time
 
-try:
-    import requests
-except ImportError:
-    print("ERROR: pip install requests")
-    sys.exit(1)
+from browser_utils import launch_chrome, connect_to_chrome
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-except ImportError:
-    print("ERROR: pip install selenium")
-    sys.exit(1)
+TIMEOUT = 300  # 5 minutes
 
-COOKIE_FILE = "session_cookies.json"
-TIMEOUT = 900  # 15 minutes
 
-print("Opening Chrome...")
-options = Options()
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-background-timer-throttling")
-options.add_argument("--disable-backgrounding-occluded-windows")
-options.add_argument("--disable-renderer-backgrounding")
+def main():
+    print("=" * 60)
+    print("CHROME CDP CONNECTION SETUP")
+    print("=" * 60)
 
-driver = webdriver.Chrome(options=options)
-driver.set_page_load_timeout(60)
+    # Launch or connect to Chrome
+    print("\nLaunching Chrome with remote debugging...")
+    launch_chrome(port=9222)
+    driver = connect_to_chrome(port=9222)
 
-try:
-    driver.get("https://www.justice.gov/epstein")
-    print("Chrome is open at the DOJ Epstein Library page.")
-    print("Please complete Queue-IT challenge + age verification.")
-    print("Polling for search box (%d min timeout)..." % (TIMEOUT // 60))
-
-    selectors = [
-        "input[type=search]",
-        "#search-field-en-small-desktop",
-        "#searchInput",
-        "input[name=query]",
-        "input[name=keys]",
-    ]
-
-    start = time.time()
-    found = False
-    while time.time() - start < TIMEOUT:
-        try:
-            _ = driver.current_url
-        except Exception as e:
-            print("ERROR: Browser disconnected: %s" % e)
-            sys.exit(1)
-
-        for sel in selectors:
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                if el.is_displayed():
-                    elapsed = int(time.time() - start)
-                    print("  Found search box (%s) after %ds!" % (sel, elapsed))
-                    found = True
-                    break
-            except Exception:
-                pass
-        if found:
-            break
-
-        elapsed = int(time.time() - start)
-        if elapsed > 0 and elapsed % 30 == 0:
-            print("  Waiting... (%ds)" % elapsed)
-        time.sleep(5)
-
-    if not found:
-        print("ERROR: Timed out waiting for search box.")
-        print("Saving cookies anyway...")
-
-    # Wait for cookies to settle
-    print("Auth detected - waiting 5s for cookies to settle...")
-    time.sleep(5)
-
-    # Navigate to the search API to trigger any additional cookies
-    try:
-        driver.get("https://www.justice.gov/multimedia-search?keys=EFTA&page=0")
-        time.sleep(3)
-    except Exception as e:
-        print("Warning: could not navigate to search API: %s" % e)
-
-    # Navigate back to trigger any remaining cookies
+    # Navigate to DOJ
+    print("Navigating to DOJ Epstein Library...")
     try:
         driver.get("https://www.justice.gov/epstein")
-        time.sleep(2)
-    except Exception as e:
-        print("Warning: could not navigate back: %s" % e)
+    except Exception:
+        pass  # May hit Queue-IT, that's fine
+    time.sleep(3)
 
-    # Grab all cookies
-    browser_cookies = driver.get_cookies()
-    cookie_dict = {}
-    for c in browser_cookies:
-        cookie_dict[c["name"]] = c["value"]
-
-    print("Captured %d cookies: %s" % (len(cookie_dict), sorted(cookie_dict.keys())))
-
-    # Save to file
-    with open(COOKIE_FILE, "w") as f:
-        json.dump(cookie_dict, f, indent=2)
-    print("Saved to %s" % COOKIE_FILE)
-
-    # Test cookies with requests library
-    print("")
-    print("Testing cookies with requests library...")
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        )
-    })
-    for name, value in cookie_dict.items():
-        session.cookies.set(name, value, domain=".justice.gov", path="/")
+    # Test browser fetch
+    print("\nTesting browser fetch() API...")
+    js = (
+        "const callback = arguments[arguments.length - 1];"
+        "(async () => {"
+        "  try {"
+        "    const resp = await fetch("
+        "      '/multimedia-search?keys=EFTA&page=0',"
+        "      {credentials: 'same-origin'}"
+        "    );"
+        "    if (!resp.ok) {"
+        "      callback(JSON.stringify({status: resp.status, ok: false}));"
+        "      return;"
+        "    }"
+        "    const data = await resp.json();"
+        "    const total = data.hits?.total?.value || data.hits?.total || 0;"
+        "    callback(JSON.stringify({ok: true, total: total}));"
+        "  } catch(e) {"
+        "    callback(JSON.stringify({error: e.message}));"
+        "  }"
+        "})();"
+    )
 
     try:
-        resp = session.get(
-            "https://www.justice.gov/multimedia-search",
-            params={"keys": "EFTA", "page": "0"},
-            timeout=15,
-        )
-        print("  Search API: HTTP %d" % resp.status_code)
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                if "hits" in data:
-                    hits = data["hits"]
-                    if isinstance(hits, dict):
-                        total = hits.get("total", {})
-                        count = total.get("value", 0) if isinstance(total, dict) else total
-                        print("  Results: %s hits - COOKIES VALID!" % count)
-                    else:
-                        print("  Got response - COOKIES VALID!")
-                else:
-                    print("  Response keys: %s" % list(data.keys()))
-            except Exception:
-                print("  Non-JSON response: %s" % resp.text[:200])
-        else:
-            print("  Cookies NOT valid (HTTP %d)" % resp.status_code)
-            print("  Response: %s" % resp.text[:200])
-    except Exception as e:
-        print("  Test failed: %s" % e)
-
-    # Also test via browser fetch
-    print("")
-    print("Testing via browser fetch...")
-    try:
-        js = (
-            "const callback = arguments[arguments.length - 1];"
-            "(async () => {"
-            "  try {"
-            "    const resp = await fetch("
-            "      '/multimedia-search?keys=EFTA&page=0',"
-            "      { credentials: 'same-origin' }"
-            "    );"
-            "    callback(JSON.stringify({status: resp.status, ok: resp.ok}));"
-            "  } catch(e) {"
-            "    callback(JSON.stringify({error: e.message}));"
-            "  }"
-            "})();"
-        )
         raw = driver.execute_async_script(js)
         result = json.loads(raw)
-        print("  Browser fetch: %s" % result)
-        if result.get("ok"):
-            print("  Browser auth is working!")
     except Exception as e:
-        print("  Browser fetch test failed: %s" % e)
+        print(f"  ERROR: {e}")
+        print("\nBrowser fetch failed. The DOJ site may require you to")
+        print("complete the Queue-IT challenge first. Check the Chrome window.")
+        sys.exit(1)
 
-finally:
-    print("")
-    print("Closing Chrome...")
+    if result.get("ok"):
+        total = result.get("total", "?")
+        print(f"  SUCCESS — fetch API working! ({total} results in index)")
+        print("\nChrome is ready. You can now run:")
+        print("  python epstein_downloader.py --csv all_urls_20260301.csv \\")
+        print('      --output "H:/My Drive/Epstein_Library"')
+    else:
+        print(f"  WARNING — fetch returned: {result}")
+        print("\nThe browser may need Queue-IT challenge completion.")
+        print("Check the Chrome window, complete any challenges, then re-run.")
+        sys.exit(1)
+
+    # Also test a file download to make sure that works
+    print("\nTesting file download via fetch()...")
+    test_js = (
+        "const callback = arguments[arguments.length - 1];"
+        "(async () => {"
+        "  try {"
+        "    const resp = await fetch("
+        "      '/multimedia-search?keys=EFTA&page=0',"
+        "      {credentials: 'same-origin'}"
+        "    );"
+        "    const data = await resp.json();"
+        "    const hits = data.hits?.hits || [];"
+        "    if (hits.length === 0) {"
+        "      callback(JSON.stringify({error: 'no hits'}));"
+        "      return;"
+        "    }"
+        "    const src = hits[0]._source || {};"
+        "    const url = src.url || '';"
+        "    if (!url) {"
+        "      callback(JSON.stringify({error: 'no url in first hit'}));"
+        "      return;"
+        "    }"
+        "    const dlResp = await fetch(url, {credentials: 'same-origin'});"
+        "    callback(JSON.stringify({"
+        "      ok: dlResp.ok,"
+        "      status: dlResp.status,"
+        "      type: dlResp.headers.get('content-type'),"
+        "      url: url"
+        "    }));"
+        "  } catch(e) {"
+        "    callback(JSON.stringify({error: e.message}));"
+        "  }"
+        "})();"
+    )
+
     try:
-        driver.quit()
-    except Exception:
-        pass
-    print("Done.")
+        raw2 = driver.execute_async_script(test_js)
+        result2 = json.loads(raw2)
+        if result2.get("ok"):
+            print(f"  File fetch OK — {result2.get('type', '?')} from {result2.get('url', '?')[:60]}")
+        else:
+            print(f"  File fetch issue: {result2}")
+    except Exception as e:
+        print(f"  File fetch test error: {e}")
+
+    print("\n" + "=" * 60)
+    print("SETUP COMPLETE — Chrome is ready for downloads")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
