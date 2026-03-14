@@ -133,6 +133,8 @@ DEFAULT_VIDEO_COLUMN = "MOV URL"
 DEFAULT_VIDEO_EXTENSIONS = [
     # Video formats
     "mov", "mp4", "wmv", "avi", "3gp", "3g2", "m4v", "mpg", "flv", "webm",
+    # Audio formats
+    "mp3", "wav", "m4a", "aac", "ogg", "wma", "flac", "aiff", "amr",
     # Image formats
     "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic", "svg",
 ]
